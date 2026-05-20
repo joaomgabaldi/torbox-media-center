@@ -96,12 +96,12 @@ class TorBoxMediaCenterFuse(Fuse):
         
         self.cache = {}
         self.cache_lock = threading.Lock()
-        self.max_blocks = 128 # Permite manter até 256MB distribuídos em RAM
+        self.max_blocks = 256
         
         self.global_state_lock = threading.Lock()
-        self.api_lock = threading.Lock()
-        self.download_semaphore = threading.Semaphore(4) # Até 4 conexões simultâneas com a CDN
-        self.CHUNK_SIZE = 2 * 1024 * 1024 # 2MB por bloco
+        self.read_locks = {}
+        self.download_semaphore = threading.Semaphore(8)
+        self.CHUNK_SIZE = 1 * 1024 * 1024 # 1MB
 
     def getFiles(self):
         while True:
@@ -111,6 +111,12 @@ class TorBoxMediaCenterFuse(Fuse):
                 self.vfs = VirtualFileSystem(self.files)
                 logging.debug(f"Updated {len(self.files)} files in VFS")
             time.sleep(300)
+
+    def _get_file_lock(self, path):
+        with self.global_state_lock:
+            if path not in self.read_locks:
+                self.read_locks[path] = threading.Lock()
+            return self.read_locks[path]
         
     def getattr(self, path):
         st = FuseStat()
@@ -174,12 +180,14 @@ class TorBoxMediaCenterFuse(Fuse):
             if path not in self.cached_links or current_time - self.cached_links[path]['timestamp'] > LINK_AGE:
                 needs_link = True
                 
-        # Proteção rigorosa contra Rate Limit da API do TorBox na resolução do link
+        file_lock = self._get_file_lock(path)
+        
         if needs_link:
-            with self.api_lock:
-                if path not in self.cached_links or current_time - self.cached_links[path]['timestamp'] > LINK_AGE:
+            with file_lock:
+                with self.global_state_lock:
+                    still_needs_link = path not in self.cached_links or time.time() - self.cached_links[path]['timestamp'] > LINK_AGE
+                if still_needs_link:
                     logging.debug(f"Resolving fresh API link for {path}")
-                    time.sleep(0.3) # Throttle incondicional para blindagem da API
                     link = getDownloadLink(file.get('download_link'))
                     with self.global_state_lock:
                         self.cached_links[path] = {
@@ -210,24 +218,27 @@ class TorBoxMediaCenterFuse(Fuse):
                 
             if not has_cache:
                 with self.download_semaphore:
-                    # Avaliação em dois estágios para evitar sobreposição entre threads
                     with self.cache_lock:
                         has_cache = cache_key in self.cache
                         
                     if not has_cache:
-                        try:
-                            block_data = downloadFile(download_link, current_block_size, block_offset)
-                            if not block_data:
-                                return -errno.EIO
-                            
+                        with file_lock:
                             with self.cache_lock:
-                                self.cache[cache_key] = block_data
-                                if len(self.cache) > self.max_blocks:
-                                    first_key = next(iter(self.cache))
-                                    del self.cache[first_key]
-                        except Exception as e:
-                            logging.error(f"Error reading network file block: {e}")
-                            return -errno.EIO
+                                has_cache = cache_key in self.cache
+                            if not has_cache:
+                                try:
+                                    block_data = downloadFile(download_link, current_block_size, block_offset)
+                                    if not block_data:
+                                        return -errno.EIO
+                                    
+                                    with self.cache_lock:
+                                        self.cache[cache_key] = block_data
+                                        if len(self.cache) > self.max_blocks:
+                                            first_key = next(iter(self.cache))
+                                            del self.cache[first_key]
+                                except Exception as e:
+                                    logging.error(f"Error reading network file block: {e}")
+                                    return -errno.EIO
             
             with self.cache_lock:
                 block_data = self.cache[cache_key]
