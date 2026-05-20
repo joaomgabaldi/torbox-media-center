@@ -110,7 +110,7 @@ def getUserDownloads(type: DownloadType):
     return files, True, f"{type.value.capitalize()} fetched successfully."
 
 def getDownloadLink(url: str):
-    response = requestWrapper(general_http_client, "GET", url)
+    response = requestWrapper(general_http_client, "GET", url, use_cache=False)
     if response.status_code == httpx.codes.TEMPORARY_REDIRECT or response.status_code == httpx.codes.PERMANENT_REDIRECT or response.status_code == httpx.codes.FOUND:
         return response.headers.get('Location')
     return url
@@ -120,7 +120,7 @@ def downloadFile(url: str, size: int, offset: int = 0):
         "Range": f"bytes={offset}-{offset + size - 1}",
         **general_http_client.headers,
     }
-    response = requestWrapper(general_http_client, "GET", url, headers=headers)
+    response = requestWrapper(general_http_client, "GET", url, use_cache=False, headers=headers)
     if response.status_code == httpx.codes.OK:
         return response.content
     elif response.status_code == httpx.codes.PARTIAL_CONTENT:
