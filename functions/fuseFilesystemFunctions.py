@@ -103,8 +103,8 @@ class TorboxStream:
                 time.sleep(1.5 * (2 ** attempt) + random.uniform(0.1, 0.5))
                 if attempt == 4: raise
         
-        # Pull alinhado à volumetria de requisição FUSE máxima nativa
-        self.iterator = self.response.iter_bytes(chunk_size=131072)
+        # O iter_bytes atua como pull; só traciona dados da rede quando bufferizado ativamente
+        self.iterator = self.response.iter_bytes(chunk_size=1 * 1024 * 1024)
 
     def read(self, size):
         if self.closed:
@@ -232,6 +232,7 @@ class TorBoxMediaCenterFuse(Fuse):
         if offset + size > file_size:
             size = file_size - offset
             
+        # Resolução de link via API 
         current_time = time.time()
         with self.global_state_lock:
             needs_link = path not in self.cached_links or current_time - self.cached_links[path]['timestamp'] > LINK_AGE
@@ -257,14 +258,17 @@ class TorBoxMediaCenterFuse(Fuse):
                 if stream.cursor == offset:
                     pass
                 elif offset > stream.cursor and offset - stream.cursor <= 4 * 1024 * 1024:
+                    # Se o SO saltou uma porção pequena de bytes, ignora fechamento e puxa bytes passivos 
                     stream.read(offset - stream.cursor)
                 else:
+                    # Seek intencional acionado: mata a conexão antiga e destrói o buffer
                     stream.close()
                     stream = None
                     
             if not stream:
                 with self.global_state_lock:
                     if len(self.active_streams) >= self.MAX_CONCURRENT_STREAMS:
+                        # Expurga soquetes de arquivos passados caso o SO abra muitos arquivos concorrentes
                         paths_to_kill = [p for p in list(self.active_streams.keys()) if p != path]
                         if paths_to_kill:
                             kill_path = paths_to_kill[0]
@@ -277,6 +281,7 @@ class TorBoxMediaCenterFuse(Fuse):
             return stream.read(size)
     
     def release(self, path, fh):
+        # Ação crítica: Quando o File Explorer termina de extrair metadados, o soquete é desconectado instantaneamente.
         with self.global_state_lock:
             if path in self.active_streams:
                 self.active_streams[path].close()
