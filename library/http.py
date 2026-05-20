@@ -5,6 +5,7 @@ import time
 import logging
 import hashlib
 import json
+import threading
 import random
 
 TORBOX_API_URL = "https://api.torbox.app/v1/api"
@@ -12,6 +13,10 @@ TORBOX_SEARCH_API_URL = "https://search-api.torbox.app"
 USER_AGENT = f"TorBox-Media-Center/{getCurrentVersion()} TorBox/1.0"
 CACHE_TTL = 300 # cache time-to-live in seconds
 _cache: dict[str, tuple[float, httpx.Response]] = {}
+
+_global_req_lock = threading.Lock()
+_last_req_time = 0.0
+REQ_COOLDOWN = 0.35 # Impede banimento bloqueando o início de requisições a mais de ~3 reqs/sec
 
 def makeCacheKey(method: str, url: str, base_url: str, **kwargs) -> str:
     key_data = {
@@ -25,7 +30,7 @@ def makeCacheKey(method: str, url: str, base_url: str, **kwargs) -> str:
     key_str = json.dumps(key_data, sort_keys=True, default=str)
     return hashlib.sha256(key_str.encode()).hexdigest()
 
-limits = httpx.Limits(max_keepalive_connections=16, max_connections=32)
+limits = httpx.Limits(max_keepalive_connections=8, max_connections=16)
 transport = httpx.HTTPTransport(retries=5, limits=limits)
 
 api_http_client = httpx.Client(
@@ -62,6 +67,7 @@ general_http_client = httpx.Client(
 
 
 def requestWrapper(client: httpx.Client, method: str, url: str, use_cache: bool = True, **kwargs) -> httpx.Response:
+    global _last_req_time
     max_retries = 5
     backoff_factor = 1.5
     
@@ -80,6 +86,14 @@ def requestWrapper(client: httpx.Client, method: str, url: str, use_cache: bool 
     
     for attempt in range(max_retries):
         try:
+            # Aplica staggered delay global para evitar spikes de TCP no CDN
+            with _global_req_lock:
+                now = time.time()
+                elapsed = now - _last_req_time
+                if elapsed < REQ_COOLDOWN:
+                    time.sleep(REQ_COOLDOWN - elapsed)
+                _last_req_time = time.time()
+
             response = client.request(method, url, **kwargs)
             
             if response.is_error:
@@ -93,6 +107,7 @@ def requestWrapper(client: httpx.Client, method: str, url: str, use_cache: bool 
         except httpx.HTTPStatusError as e:
             bad_response_codes = [429]
             if e.response.status_code in bad_response_codes:
+                # O jitter afasta threads concorrentes quando todas sofrem timeout simultâneo
                 wait_time = backoff_factor * (2 ** attempt) + random.uniform(0.1, 0.7)
                 logging.warning(f"Received {e.response.status_code} for {url}. Retrying in {wait_time:.2f} seconds...")
                 time.sleep(wait_time)

@@ -3,12 +3,15 @@ import os
 from library.filesystem import MOUNT_PATH
 import stat
 import errno
-from functions.torboxFunctions import getDownloadLink, downloadFile
+from functions.torboxFunctions import getDownloadLink
+from library.http import general_http_client
 import time
 import sys
 import logging
 from functions.appFunctions import getAllUserDownloads
 import threading
+import httpx
+import random
 from sys import platform
 
 try:
@@ -69,7 +72,68 @@ class VirtualFileSystem:
         
     def list_dir(self, path):
         return self.structure.get(path, [])
-    
+
+class TorboxStream:
+    """Mantém um fluxo HTTP persistente para leituras sequenciais do SO, bypassando rate limits."""
+    def __init__(self, url, offset, file_size):
+        self.url = url
+        self.offset = offset
+        self.file_size = file_size
+        self.buffer = bytearray()
+        self.cursor = offset
+        self.closed = False
+        
+        headers = {
+            "Range": f"bytes={offset}-",
+            **general_http_client.headers
+        }
+        
+        request = general_http_client.build_request("GET", url, headers=headers)
+        
+        for attempt in range(5):
+            try:
+                self.response = general_http_client.send(request, stream=True)
+                if self.response.status_code in [429]:
+                    self.response.close()
+                    time.sleep(1.5 * (2 ** attempt) + random.uniform(0.1, 0.5))
+                    continue
+                self.response.raise_for_status()
+                break
+            except httpx.RequestError as e:
+                time.sleep(1.5 * (2 ** attempt) + random.uniform(0.1, 0.5))
+                if attempt == 4: raise
+        
+        # O iter_bytes atua como pull; só traciona dados da rede quando bufferizado ativamente
+        self.iterator = self.response.iter_bytes(chunk_size=1 * 1024 * 1024)
+
+    def read(self, size):
+        if self.closed:
+            return b''
+            
+        while len(self.buffer) < size:
+            try:
+                chunk = next(self.iterator)
+                self.buffer.extend(chunk)
+            except StopIteration:
+                break
+            except Exception as e:
+                logging.error(f"Stream read error: {e}")
+                break
+        
+        read_size = min(size, len(self.buffer))
+        data = bytes(self.buffer[:read_size])
+        self.buffer = self.buffer[read_size:]
+        self.cursor += read_size
+        return data
+        
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            try:
+                self.response.close()
+            except:
+                pass
+
 class FuseStat(fuse.Stat):
     def __init__(self):
         self.st_mode = 0
@@ -91,17 +155,12 @@ class TorBoxMediaCenterFuse(Fuse):
 
         self.files = []
         self.vfs = VirtualFileSystem(self.files)
-        self.file_handles = {}
         self.cached_links = {}
         
-        self.cache = {}
-        self.cache_lock = threading.Lock()
-        self.max_blocks = 256
-        
+        self.active_streams = {}
+        self.stream_locks = {}
         self.global_state_lock = threading.Lock()
-        self.read_locks = {}
-        self.download_semaphore = threading.Semaphore(8)
-        self.CHUNK_SIZE = 1 * 1024 * 1024 # 1MB
+        self.MAX_CONCURRENT_STREAMS = 12
 
     def getFiles(self):
         while True:
@@ -112,11 +171,11 @@ class TorBoxMediaCenterFuse(Fuse):
                 logging.debug(f"Updated {len(self.files)} files in VFS")
             time.sleep(300)
 
-    def _get_file_lock(self, path):
+    def _get_stream_lock(self, path):
         with self.global_state_lock:
-            if path not in self.read_locks:
-                self.read_locks[path] = threading.Lock()
-            return self.read_locks[path]
+            if path not in self.stream_locks:
+                self.stream_locks[path] = threading.Lock()
+            return self.stream_locks[path]
         
     def getattr(self, path):
         st = FuseStat()
@@ -173,86 +232,60 @@ class TorBoxMediaCenterFuse(Fuse):
         if offset + size > file_size:
             size = file_size - offset
             
+        # Resolução de link via API 
         current_time = time.time()
-        needs_link = False
-        
         with self.global_state_lock:
-            if path not in self.cached_links or current_time - self.cached_links[path]['timestamp'] > LINK_AGE:
-                needs_link = True
-                
-        file_lock = self._get_file_lock(path)
-        
+            needs_link = path not in self.cached_links or current_time - self.cached_links[path]['timestamp'] > LINK_AGE
+            
         if needs_link:
-            with file_lock:
-                with self.global_state_lock:
-                    still_needs_link = path not in self.cached_links or time.time() - self.cached_links[path]['timestamp'] > LINK_AGE
-                if still_needs_link:
-                    logging.debug(f"Resolving fresh API link for {path}")
-                    link = getDownloadLink(file.get('download_link'))
-                    with self.global_state_lock:
-                        self.cached_links[path] = {
-                            'link': link,
-                            'timestamp': time.time()
-                        }
+            logging.debug(f"Resolving fresh API link for {path}")
+            link = getDownloadLink(file.get('download_link'))
+            with self.global_state_lock:
+                self.cached_links[path] = {
+                    'link': link,
+                    'timestamp': time.time()
+                }
 
         with self.global_state_lock:
             download_link = self.cached_links[path]['link']
             
-        start_block = offset // self.CHUNK_SIZE
-        end_block = (offset + size - 1) // self.CHUNK_SIZE
+        lock = self._get_stream_lock(path)
         
-        buffer = bytearray()
-        
-        for block_index in range(start_block, end_block + 1):
-            block_offset = block_index * self.CHUNK_SIZE
-            block_end = min((block_index + 1) * self.CHUNK_SIZE - 1, file_size - 1)
-            current_block_size = block_end - block_offset + 1
+        with lock:
+            stream = self.active_streams.get(path)
             
-            if current_block_size <= 0:
-                continue
+            if stream:
+                if stream.cursor == offset:
+                    pass
+                elif offset > stream.cursor and offset - stream.cursor <= 4 * 1024 * 1024:
+                    # Se o SO saltou uma porção pequena de bytes, ignora fechamento e puxa bytes passivos 
+                    stream.read(offset - stream.cursor)
+                else:
+                    # Seek intencional acionado: mata a conexão antiga e destrói o buffer
+                    stream.close()
+                    stream = None
+                    
+            if not stream:
+                with self.global_state_lock:
+                    if len(self.active_streams) >= self.MAX_CONCURRENT_STREAMS:
+                        # Expurga soquetes de arquivos passados caso o SO abra muitos arquivos concorrentes
+                        paths_to_kill = [p for p in list(self.active_streams.keys()) if p != path]
+                        if paths_to_kill:
+                            kill_path = paths_to_kill[0]
+                            self.active_streams[kill_path].close()
+                            del self.active_streams[kill_path]
+                            
+                stream = TorboxStream(download_link, offset, file_size)
+                self.active_streams[path] = stream
                 
-            cache_key = (path, block_index)
-            
-            with self.cache_lock:
-                has_cache = cache_key in self.cache
-                
-            if not has_cache:
-                with self.download_semaphore:
-                    with self.cache_lock:
-                        has_cache = cache_key in self.cache
-                        
-                    if not has_cache:
-                        with file_lock:
-                            with self.cache_lock:
-                                has_cache = cache_key in self.cache
-                            if not has_cache:
-                                try:
-                                    block_data = downloadFile(download_link, current_block_size, block_offset)
-                                    if not block_data:
-                                        return -errno.EIO
-                                    
-                                    with self.cache_lock:
-                                        self.cache[cache_key] = block_data
-                                        if len(self.cache) > self.max_blocks:
-                                            first_key = next(iter(self.cache))
-                                            del self.cache[first_key]
-                                except Exception as e:
-                                    logging.error(f"Error reading network file block: {e}")
-                                    return -errno.EIO
-            
-            with self.cache_lock:
-                block_data = self.cache[cache_key]
-            
-            start_offset_in_block = max(0, offset - block_offset)
-            end_offset_in_block = min(len(block_data), offset + size - block_offset)
-            
-            buffer.extend(block_data[start_offset_in_block:end_offset_in_block])
-        
-        return bytes(buffer)
+            return stream.read(size)
     
     def release(self, path, fh):
-        if fh in self.file_handles:
-            del self.file_handles[fh]
+        # Ação crítica: Quando o File Explorer termina de extrair metadados, o soquete é desconectado instantaneamente.
+        with self.global_state_lock:
+            if path in self.active_streams:
+                self.active_streams[path].close()
+                del self.active_streams[path]
         return 0
     
 def runFuse():
