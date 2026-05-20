@@ -37,15 +37,12 @@ class VirtualFileSystem:
             if not original_path:
                 continue
             
-            # Remove barras iniciais para evitar elementos vazios no split
             original_path = original_path.lstrip('/')
             parts = original_path.split('/')
             
-            # Mapeamento do arquivo completo
             file_path = f"/{original_path}"
             self.file_map[file_path] = f
             
-            # Construção recursiva da estrutura de diretórios
             current_path = ""
             for part in parts[:-1]:
                 parent = current_path if current_path else "/"
@@ -54,12 +51,10 @@ class VirtualFileSystem:
                 self.structure.setdefault(parent, set()).add(part)
                 self.structure.setdefault(current_path, set())
             
-            # Adiciona o arquivo no diretório correspondente
             file_name = parts[-1]
             parent = current_path if current_path else "/"
             self.structure.setdefault(parent, set()).add(file_name)
 
-        # Ordenação consistente
         for key in self.structure:
             self.structure[key] = sorted(list(self.structure[key]))
 
@@ -155,6 +150,14 @@ class TorBoxMediaCenterFuse(Fuse):
 
         if not file:
             return -errno.ENOENT
+        
+        file_size = file.get('file_size', 0)
+        
+        if offset >= file_size:
+            return b''
+            
+        if offset + size > file_size:
+            size = file_size - offset
         
         current_time = time.time()
         if path not in self.cached_links:
