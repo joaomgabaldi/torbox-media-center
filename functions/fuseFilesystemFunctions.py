@@ -27,33 +27,41 @@ LINK_AGE = 3 * 60 * 60 # 3 hours
 class VirtualFileSystem:
     def __init__(self, files_list):
         self.files = files_list
-        self.structure = self._build_structure()
-        self.file_map = self._build_file_map()
+        self.structure = { '/': set() }
+        self.file_map = {}
+        self._build()
 
-    def _build_structure(self):
-        structure = { '/': set() }
+    def _build(self):
         for f in self.files:
             original_path = f.get("path")
-            if original_path:
-                parts = original_path.split('/')
-                current_path = '/'
-                for part in parts[:-1]:
-                    if part not in structure.get(current_path, set()):
-                        structure.setdefault(current_path, set()).add(part)
-                        current_path = f"{current_path}{part}/"
-                        structure.setdefault(current_path, set())
-        for key in structure:
-            structure[key] = sorted([item for item in structure[key] if item is not None])
-        return structure
+            if not original_path:
+                continue
+            
+            # Remove barras iniciais para evitar elementos vazios no split
+            original_path = original_path.lstrip('/')
+            parts = original_path.split('/')
+            
+            # Mapeamento do arquivo completo
+            file_path = f"/{original_path}"
+            self.file_map[file_path] = f
+            
+            # Construção recursiva da estrutura de diretórios
+            current_path = ""
+            for part in parts[:-1]:
+                parent = current_path if current_path else "/"
+                current_path = f"{current_path}/{part}" if current_path else f"/{part}"
+                
+                self.structure.setdefault(parent, set()).add(part)
+                self.structure.setdefault(current_path, set())
+            
+            # Adiciona o arquivo no diretório correspondente
+            file_name = parts[-1]
+            parent = current_path if current_path else "/"
+            self.structure.setdefault(parent, set()).add(file_name)
 
-    def _build_file_map(self):
-        file_map = {}
-        for f in self.files:
-            original_path = f.get("path")
-            if original_path:
-                path = f'/{original_path}'
-                file_map[path] = f
-        return file_map
+        # Ordenação consistente
+        for key in self.structure:
+            self.structure[key] = sorted(list(self.structure[key]))
 
     def is_dir(self, path):
         return path in self.structure
@@ -163,7 +171,6 @@ class TorBoxMediaCenterFuse(Fuse):
         download_link = self.cached_links[path]['link']
         
         try:
-            # Requisita exatamente a porção demandada pelo driver FUSE
             block_data = downloadFile(download_link, size, offset)
             if not block_data:
                 return -errno.EIO
