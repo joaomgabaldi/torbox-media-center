@@ -81,7 +81,10 @@ def requestWrapper(client: httpx.Client, method: str, url: str, use_cache: bool 
     for attempt in range(max_retries):
         try:
             response = client.request(method, url, **kwargs)
-            response.raise_for_status()
+            
+            # Aciona exceção apenas para erros 4xx e 5xx, permitindo o fluxo de redirecionamentos (3xx).
+            if response.is_error:
+                response.raise_for_status()
             
             if cacheable and cache_key:
                 _cache[cache_key] = (time.time(), response)
