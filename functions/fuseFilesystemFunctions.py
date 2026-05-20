@@ -11,7 +11,6 @@ from functions.appFunctions import getAllUserDownloads
 import threading
 from sys import platform
 
-# Pull in some spaghetti to make this stuff work without fuse-py being installed
 try:
     import _find_fuse_parts # type: ignore # noqa: F401
 except ImportError:
@@ -32,80 +31,29 @@ class VirtualFileSystem:
         self.file_map = self._build_file_map()
 
     def _build_structure(self):
-        if RAW_MODE:
-            structure = { '/': set() }
-            for f in self.files:
-                original_path = f.get("path")
-                if original_path:
-                    # Split the path into parts
-                    parts = original_path.split('/')
-                    current_path = '/'
-                    for part in parts[:-1]:  # Skip the filename
-                        if part not in structure.get(current_path, set()):
-                            structure.setdefault(current_path, set()).add(part)
-                            current_path = f"{current_path}{part}/"
-                            structure.setdefault(current_path, set())
-            # Ensure consistent ordering
-            for key in structure:
-                structure[key] = sorted([item for item in structure[key] if item is not None])
-            return structure
-        else:
-            structure = {
-                '/': ['movies', 'series'],
-                '/movies': set(),
-                '/series': set()
-            }
-        
-        
+        structure = { '/': set() }
         for f in self.files:
-            media_type = f.get('metadata_mediatype')
-            root_folder = f.get('metadata_rootfoldername')
-            
-            if media_type == 'movie':
-                path = f'/movies/{root_folder}'
-                structure['/movies'].add(root_folder)
-                
-                if path not in structure:
-                    structure[path] = set()
-                structure[path].add(f.get('metadata_filename'))
-                
-            elif media_type == 'series':
-                path = f'/series/{root_folder}'
-                structure['/series'].add(root_folder)
-                
-                if path not in structure:
-                    structure[path] = set()
-                structure[path].add(f.get('metadata_foldername'))
-                
-                season_path = f'{path}/{f.get("metadata_foldername")}'
-                if season_path not in structure:
-                    structure[season_path] = set()
-                structure[season_path].add(f.get('metadata_filename'))
-        
-        # consistent ordering
+            original_path = f.get("path")
+            if original_path:
+                parts = original_path.split('/')
+                current_path = '/'
+                for part in parts[:-1]:
+                    if part not in structure.get(current_path, set()):
+                        structure.setdefault(current_path, set()).add(part)
+                        current_path = f"{current_path}{part}/"
+                        structure.setdefault(current_path, set())
         for key in structure:
             structure[key] = sorted([item for item in structure[key] if item is not None])
-            
         return structure
 
     def _build_file_map(self):
         file_map = {}
         for f in self.files:
-            if RAW_MODE:
-                original_path = f.get("path")
-                if original_path:
-                    path = f'/{original_path}'
-                    file_map[path] = f
-            else:
-                if f.get('metadata_mediatype') == 'movie':
-                    path = f'/movies/{f.get("metadata_rootfoldername")}/{f.get("metadata_filename")}'
-                    file_map[path] = f
-                else:  # series
-                    path = f'/series/{f.get("metadata_rootfoldername")}/{f.get("metadata_foldername")}/{f.get("metadata_filename")}'
-                    file_map[path] = f
-
+            original_path = f.get("path")
+            if original_path:
+                path = f'/{original_path}'
+                file_map[path] = f
         return file_map
-
 
     def is_dir(self, path):
         return path in self.structure
@@ -144,10 +92,6 @@ class TorBoxMediaCenterFuse(Fuse):
         self.next_handle = 1
         self.cached_links = {}
 
-        self.cache = {}
-        self.block_size = 1024 * 1024 * 64  # 64MB Blocks
-        self.max_blocks = 64 # Max 64 blocks in cache (4GB)
-
     def getFiles(self):
         while True:
             files = getAllUserDownloads()
@@ -180,7 +124,6 @@ class TorBoxMediaCenterFuse(Fuse):
             st.st_size = file_info.get('file_size', 0)
             return st
             
-        # Not found
         return -errno.ENOENT
     
     def readdir(self, path, _):
@@ -199,9 +142,7 @@ class TorBoxMediaCenterFuse(Fuse):
             return -errno.EACCES
     
     def read(self, path, size, offset):
-        logging.debug(f"READ Path: {path}")
-        logging.debug(f"READ Size: {size}")
-        logging.debug(f"READ Offset: {offset}")
+        logging.debug(f"READ Path: {path} Size: {size} Offset: {offset}")
         file = self.vfs.get_file(path)
 
         if not file:
@@ -221,39 +162,15 @@ class TorBoxMediaCenterFuse(Fuse):
             }
         download_link = self.cached_links[path]['link']
         
-        start_block = offset // self.block_size
-        end_block = (offset + size - 1) // self.block_size
-        
-        buffer = bytearray()
-        
-        for block_index in range(start_block, end_block + 1):
-            block_offset = block_index * self.block_size
-            block_end = min((block_index + 1) * self.block_size - 1, file.get('file_size') - 1)
-            current_block_size = block_end - block_offset + 1
-            
-            # check for block
-            if (path, block_index) not in self.cache:
-                logging.debug(f"Cache miss for block {block_index}, fetching...")
-                # get block
-                block_data = downloadFile(download_link, current_block_size, block_offset)
-                if not block_data:
-                    return -errno.EIO
-                # save block to cache
-                self.cache[(path, block_index)] = block_data
-                # lru cache
-                if len(self.cache) > self.max_blocks * len(self.cached_links):
-                    keys_to_remove = list(self.cache.keys())[:len(self.cache) - self.max_blocks]
-                    for key in keys_to_remove:
-                        del self.cache[key]
-            # get block from cache
-            block_data = self.cache[(path, block_index)]
-            
-            start_offset_in_block = max(0, offset - block_offset)
-            end_offset_in_block = min(len(block_data), offset + size - block_offset)
-            
-            buffer.extend(block_data[start_offset_in_block:end_offset_in_block])
-        
-        return bytes(buffer)
+        try:
+            # Requisita exatamente a porção demandada pelo driver FUSE
+            block_data = downloadFile(download_link, size, offset)
+            if not block_data:
+                return -errno.EIO
+            return block_data
+        except Exception as e:
+            logging.error(f"Error reading file: {e}")
+            return -errno.EIO
     
     def release(self, _, fh):
         if fh in self.file_handles:
