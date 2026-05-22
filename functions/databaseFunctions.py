@@ -1,6 +1,7 @@
 from tinydb import TinyDB
 import threading
 import logging
+import os
 
 db_connections = {}
 db_locks = {}
@@ -10,17 +11,27 @@ def getDatabase(name: str = "db"):
     """
     Returns the TinyDB database instance with thread-safe storage.
     Uses a connection pool pattern to avoid creating multiple connections.
+    Includes automatic corruption recovery by forcing an immediate read.
     """
-    global db_connections, db_locks # global cause I'm lazy
+    global db_connections, db_locks
     
     with global_lock:
         if name not in db_connections:
+            db_path = f"{name}.json"
             try:
-                db_connections[name] = TinyDB(f"{name}.json")
+                db = TinyDB(db_path)
+                db.all()  # Força a leitura do arquivo para acionar exceções de corrupção do JSON imediatamente
+                db_connections[name] = db
                 db_locks[name] = threading.Lock()
             except Exception as e:
-                logging.error(f"Error connecting to the database: {e}")
-                return None
+                logging.warning(f"Database {name} is corrupted or invalid ({e}). Recreating a new database file...")
+                if os.path.exists(db_path):
+                    try:
+                        os.remove(db_path)
+                    except Exception as rm_e:
+                        logging.error(f"Failed to delete corrupted database file {db_path}: {rm_e}")
+                db_connections[name] = TinyDB(db_path)
+                db_locks[name] = threading.Lock()
     
     return db_connections[name]
 
