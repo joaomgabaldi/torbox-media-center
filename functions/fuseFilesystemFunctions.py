@@ -267,16 +267,31 @@ class TorBoxMediaCenterFuse(Fuse):
                     
             if not stream:
                 with self.global_state_lock:
-                    if len(self.active_streams) >= self.MAX_CONCURRENT_STREAMS:
-                        # Expurga soquetes de arquivos passados caso o SO abra muitos arquivos concorrentes
+                    while len(self.active_streams) >= self.MAX_CONCURRENT_STREAMS:
                         paths_to_kill = [p for p in list(self.active_streams.keys()) if p != path]
-                        if paths_to_kill:
-                            kill_path = paths_to_kill[0]
-                            self.active_streams[kill_path].close()
-                            del self.active_streams[kill_path]
-                            
-                stream = TorboxStream(download_link, offset, file_size)
-                self.active_streams[path] = stream
+                        if not paths_to_kill:
+                            break
+                        kill_path = paths_to_kill[0]
+                        old_stream = self.active_streams.pop(kill_path)
+                        if old_stream is not None:
+                            try:
+                                old_stream.close()
+                            except Exception:
+                                pass
+                    
+                    # Reserva imediata do slot previne a condição de corrida entre múltiplas threads
+                    self.active_streams[path] = None
+                    
+                try:
+                    stream = TorboxStream(download_link, offset, file_size)
+                except Exception as e:
+                    with self.global_state_lock:
+                        if path in self.active_streams and self.active_streams[path] is None:
+                            del self.active_streams[path]
+                    raise e
+                
+                with self.global_state_lock:
+                    self.active_streams[path] = stream
                 
             return stream.read(size)
     
@@ -284,8 +299,12 @@ class TorBoxMediaCenterFuse(Fuse):
         # Ação crítica: Quando o File Explorer termina de extrair metadados, o soquete é desconectado instantaneamente.
         with self.global_state_lock:
             if path in self.active_streams:
-                self.active_streams[path].close()
-                del self.active_streams[path]
+                stream = self.active_streams.pop(path)
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
         return 0
     
 def runFuse():
